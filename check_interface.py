@@ -7,10 +7,10 @@ import time
 from collections import defaultdict
 
 from pysnmp.entity.engine import SnmpEngine
-from pysnmp.hlapi import ContextData, CommunityData, UdpTransportTarget, nextCmd, ObjectType, ObjectIdentity
+from pysnmp.hlapi import ContextData, CommunityData, UdpTransportTarget, nextCmd, getCmd, ObjectType, ObjectIdentity
 from pysnmp.proto.errind import ErrorIndication
 
-from vars import eth_status, exit_status_map
+from vars import eth_status, exit_status_map, CISCO_VLAN_MEMBERSHIP
 
 default_if_name_format = "^(Gigabit|Fast)Ethernet.*|eth\d+|enp\d.*|wlan\d+|tun\d+|ppp\d+$"
 
@@ -94,7 +94,7 @@ def get_if_spec_from_cmd(cmd, ifs_search):
         if err_ind is not None:
             raise err_ind
 
-        if_name = str(if_snmp[0][1])
+        if_name = str(if_snmp[1][1])
         if_search_match = None
         for if_search, if_regex in ifs_search_map.items():
             if if_regex.match(if_name):
@@ -102,12 +102,13 @@ def get_if_spec_from_cmd(cmd, ifs_search):
                 break
         if if_search_match is not None:
             ifs_spec[if_search_match].append({
+                "index": int(if_snmp[0][1]),
                 "name": if_name,
-                "status": eth_status[int(if_snmp[1][1])],
-                "adm_status": eth_status[int(if_snmp[2][1])],
-                "speed": int(if_snmp[3][1]),
-                "in": int(if_snmp[4][1]),
-                "out": int(if_snmp[5][1])
+                "status": eth_status[int(if_snmp[2][1])],
+                "adm_status": eth_status[int(if_snmp[3][1])],
+                "speed": int(if_snmp[4][1]),
+                "in": int(if_snmp[5][1]),
+                "out": int(if_snmp[6][1])
             })
 
     return ifs_spec
@@ -121,6 +122,7 @@ def if_check(interfaces_search):
 
     cmd = nextCmd(
         engine, community, transport, context,
+        ObjectType(ObjectIdentity('IF-MIB', 'ifIndex')),
         ObjectType(ObjectIdentity('IF-MIB', 'ifDescr')),
         ObjectType(ObjectIdentity('IF-MIB', 'ifOperStatus')),
         ObjectType(ObjectIdentity('IF-MIB', 'ifAdminStatus')),
@@ -137,9 +139,9 @@ def if_check(interfaces_search):
         if_error.append(e)
     else:
         for if_search in interfaces_search:
-
             if if_search in ifs_spec:
                 for if_spec in ifs_spec[if_search]:
+
                     if_io_min = "-"
                     if_io_max = "-"
                     if_in_warning = "-"
@@ -150,12 +152,25 @@ def if_check(interfaces_search):
                     if_out_mbps = "-"
                     if_in_util = "-"
                     if_out_util = "-"
+                    if_vlan = None
 
                     if_name = if_spec["name"]
                     if_oper_status = if_spec["status"]
+                    if_adm_status = if_spec["adm_status"]
                     if_speed = if_spec["speed"]
                     if_in_tot = if_spec["in"]
                     if_out_tot = if_spec["out"]
+
+                    if get_vlan:
+                        err_ind, err_stat, err_idx, if_snmp = next(getCmd(
+                            engine, community, transport, context,
+                            ObjectType(
+                                ObjectIdentity('SNMPv2-SMI', 'enterprises', CISCO_VLAN_MEMBERSHIP, if_spec["index"]))
+                        ))
+                        try:
+                            if_vlan = " - vLAN {}".format(int(if_snmp[0][1]))
+                        except ValueError:
+                            pass
 
                     if_metrics = None
                     if_file = "/tmp/_snmp-check_{}_{}".format(host, if_name.replace("/", "_"))
@@ -176,10 +191,10 @@ def if_check(interfaces_search):
                         pass
 
                     if check_if_status:
-                        if_adm_status = if_spec["adm_status"]
                         if if_oper_status != if_adm_status:
                             exit_code = exit_status_map["WARNING"]
-                            if_error.append("{}: (is {}/{})".format(if_name, if_oper_status, if_adm_status))
+                            if_error.append("{}: (is {} not {})".format(if_name, if_oper_status, if_adm_status))
+                            if_oper_status = "({})".format(if_oper_status)
 
                     if if_speed > 0:
                         if_io_min = "0"
@@ -205,7 +220,9 @@ def if_check(interfaces_search):
                                 (if_out_tot - if_metrics['if_out_octets']) * 8 * 100 / if_tot_band)
 
                     if_status.append(
-                        "{}: ({}%,{}%) {}".format(if_name, if_in_util, if_out_util, if_oper_status))
+                        "{}: ({}%,{}%) {}{}".format(
+                            if_name, if_in_util, if_out_util, if_oper_status,
+                            if_vlan if if_vlan is not None else ""))
 
                     if octects_only:
                         if_perf.append("'{} in'={}c".format(if_name, if_in_tot))
@@ -248,9 +265,11 @@ if __name__ == "__main__":
     parser.add_argument("-f", "--newintformat", type=str,
                         default=default_if_name_format,
                         help="New interfaces format")
-    parser.add_argument("-s", "--checkint", type=bool, default=False,
+    parser.add_argument("-v", "--vlan", action="store_true",
+                        help="Get vLAN")
+    parser.add_argument("-s", "--checkstatus", action="store_true",
                         help="Check interface status")
-    parser.add_argument("-o", "--octectsonly", type=bool, default=True,
+    parser.add_argument("-o", "--octectsonly", action="store_true",
                         help="I/O usage critical")
     parser.add_argument("-w", "--warning", type=list, default=[60, 60],
                         help="I/O usage warning")
@@ -264,7 +283,8 @@ if __name__ == "__main__":
     timeout = args.timeout
     interfaces = args.interfaces
     new_int_name_format = args.newintformat
-    check_if_status = args.checkint
+    check_if_status = args.checkstatus
+    get_vlan = args.vlan
     warning_threshold = args.warning
     critical_threshold = args.critical
     octects_only = args.octectsonly

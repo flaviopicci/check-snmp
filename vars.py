@@ -7,6 +7,8 @@ def merge_dicts(*dict_args):
     return result
 
 
+CISCO_VLAN_MEMBERSHIP = '9.9.68.1.2.2.1.2'
+
 exit_status_map = {
     "OK": 0,
     "WARNING": 1,
